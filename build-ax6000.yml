@@ -28,10 +28,6 @@ on:
         description: '同时创建 Release（更好下载，需写权限）'
         type: boolean
         default: true
-      proxy_enable:
-        description: '编译期间拉取源码走加速（海外 runner 一般不需要，保持 false）'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -148,6 +144,20 @@ jobs:
           CONFIG_PACKAGE_luci-app-diskman=y
           CONFIG_PACKAGE_luci-app-zerotier=y
           CONFIG_PACKAGE_zerotier=y
+          # -------- 关键修复：显式选中 ppp 内核模块 --------
+          # 背景：include/target.mk 的 DEFAULT_PACKAGES.router 强制包含 ppp + ppp-mod-pppoe。
+          #   但 DEFAULT_PACKAGES 不经过 Kconfig，因此 make defconfig 不会自动把
+          #   它的 kmod 依赖写进 .config；而 kmod-*.ipk 只在 .config 选中时才编译。
+          #   结果：package/install 阶段 opkg 装 ppp-mod-pppoe 时找不到 kmod-pppoe
+          #   → "Configuring ppp-mod-pppoe." 后 Error 255。
+          #   显式选中下列 kmod，内核会打开 CONFIG_PPP/PPPOE，ipk 正常生成。
+          #   依赖链：ppp-mod-pppoe → kmod-pppoe → kmod-ppp + kmod-pppox
+          #                                       → kmod-ppp → kmod-lib-crc-ccitt + kmod-slhc
+          CONFIG_PACKAGE_kmod-ppp=y
+          CONFIG_PACKAGE_kmod-pppoe=y
+          CONFIG_PACKAGE_kmod-pppox=y
+          CONFIG_PACKAGE_kmod-slhc=y
+          CONFIG_PACKAGE_kmod-lib-crc-ccitt=y
           EOF
 
           echo "=== 解析配置（补齐依赖 / 丢弃不存在的包）==="
@@ -163,11 +173,39 @@ jobs:
           make download -j"$(nproc)" || make download -j8 || true
 
       - name: 编译
+        id: build
         working-directory: openwrt
         run: |
           echo "核数: $(nproc)"
+          echo "=== 关键 ppp 相关项是否进入 .config ==="
+          grep -E '^CONFIG_PACKAGE_kmod-(ppp|pppoe|pppox|slhc|lib-crc-ccitt)=' .config || true
+          echo
           # 第一次并行编译；失败则单线程重跑以拿到详细报错（便于排查）
-          make -j"$(nproc)" || make -j1 V=s
+          if ! make -j"$(nproc)"; then
+            echo "########## 并行编译失败，转 -j1 V=s 单线程重跑以取详细日志 ##########"
+            set +e
+            make -j1 V=s 2>&1 | tee /tmp/build_verbose.log
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "########## -j1 V=s 退出码=$rc ##########"
+            echo
+            echo "=== 失败点附近的日志（最后 120 行）==="
+            tail -n 120 /tmp/build_verbose.log || true
+            echo
+            echo "=== 诊断 1：ppp/kmod 相关 ipk 是否已生成 ==="
+            find bin/packages -name 'ppp*.ipk' -o -name 'kmod-ppp*.ipk' -o -name 'kmod-slhc*.ipk' 2>/dev/null | sort || true
+            echo
+            echo "=== 诊断 2：kmod-pppoe 的 KCONFIG 是否进入内核配置 ==="
+            grep -nE 'CONFIG_(PPP|PPPOE|SLHC)([= ]|$)' build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -20 || true
+            echo
+            echo "=== 诊断 3：package/install 的安装清单里有没有 ppp-mod-pppoe ==="
+            grep -n 'ppp' tmp/opkg_install_list 2>/dev/null || echo "(opkg_install_list 不存在或未包含 ppp)"
+            echo
+            echo "=== 诊断 4：从 verbose 日志里提取 opkg 真实报错 ==="
+            grep -n -iE 'pppoe|error 255|cannot|not found|no such file|unsatisfied|kernel' /tmp/build_verbose.log 2>/dev/null | tail -60 || true
+            echo
+            exit "$rc"
+          fi
 
       # ---------------------------------------------------------------- 收集
       - name: 收集产物（只取 AX6000 110M）
