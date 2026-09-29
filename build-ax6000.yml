@@ -1,0 +1,249 @@
+name: Build ImmortalWrt for Redmi AX6000 (hanwckf, 110M layout)
+
+# ============================================================================
+# 用途：在 GitHub Actions 上云编译 Redmi AX6000 的 ImmortalWrt 固件
+# 源码：hanwckf/immortalwrt-mt798x（可逐 commit 审计，无第三方注入）
+# 布局：110M（非 stock）—— 与 hanwckf 多布局 U-Boot 匹配
+#
+# 使用方法：
+#   1. 在 GitHub 上 fork 一份 hanwckf/immortalwrt-mt798x
+#      （或新建一个空仓库，只为跑本 workflow —— 本 workflow 自己 clone 源码）
+#   2. 把本文件放到该仓库 .github/workflows/build-ax6000.yml
+#   3. 仓库 Settings → Actions → General → Workflow permissions
+#      选 "Read and write permissions"（创建 Release 需要）
+#   4. Actions 页 → 选本 workflow → Run workflow
+#
+# 产物：immortalwrt-mediatek-mt7986-xiaomi_redmi-router-ax6000-*-squashfs-sysupgrade.bin
+#       + factory.bin + initramfs + sha256sums + manifest + BUILD_PROVENANCE.txt
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_artifact:
+        description: '上传产物为 Artifact（保留 30 天）'
+        type: boolean
+        default: true
+      create_release:
+        description: '同时创建 Release（更好下载，需写权限）'
+        type: boolean
+        default: true
+      proxy_enable:
+        description: '编译期间拉取源码走加速（海外 runner 一般不需要，保持 false）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/hanwckf/immortalwrt-mt798x.git
+  REPO_BRANCH: openwrt-21.02
+  # 关键：110M 布局的设备项，注意【没有 -stock 后缀】
+  DEVICE: xiaomi_redmi-router-ax6000
+  CONFIG_FILE: defconfig/mt7986-ax6000.config
+
+jobs:
+  build:
+    name: Compile AX6000 110M firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      # ---------------------------------------------------------------- 环境
+      - name: 清理磁盘（runner 只有 ~14G，编译需要 25G+）
+        run: |
+          echo "=== before ==="; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/lib/node_modules /opt/az /usr/share/swift \
+                      /usr/local/share/powershell /usr/share/miniconda || true
+          sudo apt-get clean
+          docker image prune -af 2>/dev/null || true
+          echo "=== after ==="; df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
+            haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build \
+            p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply \
+            python3-docutils python3-pyelftools qemu-utils re2c rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim \
+            wget xmlto xxd zlib1g-dev zstd
+
+      # ---------------------------------------------------------------- 源码
+      - name: 克隆 hanwckf 源码（浅克隆，记录 commit 以便审计）
+        run: |
+          git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
+          cd openwrt
+          SHA=$(git rev-parse HEAD)
+          echo "HEAD_SHA=$SHA" >> "$GITHUB_ENV"
+          git log -1 --format='%H%n%cI%n%s' > /tmp/src_head.txt
+          echo "源码 commit: $SHA"
+          cat /tmp/src_head.txt
+
+      - name: 更新并安装 feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ---------------------------------------------------------------- 配置
+      - name: 套用 AX6000 defconfig（强制 110M 布局）
+        working-directory: openwrt
+        run: |
+          cp -f "$CONFIG_FILE" .config
+
+          # 剔除 stock 布局，确保只出 110M 那一版
+          sed -i '/DEVICE_mediatek_mt7986_DEVICE_xiaomi_redmi-router-ax6000-stock/d' .config
+          grep -q '^CONFIG_TARGET_DEVICE_mediatek_mt7986_DEVICE_xiaomi_redmi-router-ax6000=y' .config \
+            || echo 'CONFIG_TARGET_DEVICE_mediatek_mt7986_DEVICE_xiaomi_redmi-router-ax6000=y' >> .config
+
+          # 关掉其它无关机型（gl-mt6000 / re-cp-03 / rg-x60-pro / tl-xdr608x），
+          # 只保留 AX6000 —— 省掉约 30% 编译时间与磁盘
+          for dev in glinet_gl-mt6000 jdcloud_re-cp-03 ruijie-rg-x60-pro \
+                     ruijie-rg-x60-pro-stock tplink_tl-xdr6086 tplink_tl-xdr6088; do
+            sed -i "/CONFIG_TARGET_DEVICE_mediatek_mt7986_DEVICE_${dev}=y/d" .config
+            sed -i "/CONFIG_TARGET_DEVICE_PACKAGES_mediatek_mt7986_DEVICE_${dev}=/d" .config
+            echo "# CONFIG_TARGET_DEVICE_mediatek_mt7986_DEVICE_${dev} is not set" >> .config
+          done
+
+          # -------- 追加插件（全部已在上游 openwrt-21.02 分支逐一核实存在）--------
+          # 说明：hanwckf 源码基于 OpenWrt 21.02，所以用该分支真实存在的包。
+          #   - 代理：openclash / passwall / ssr-plus（homeproxy 是 25.12+ 才有，21.02 无）
+          #   - 去广告：adguardhome（二进制包，无 luci 前端，用官方 Web UI:3000）
+          #   - 分流：smartdns
+          # 注意：用 sed 去掉 YAML 缩进带进来的前导空格，保证是标准 ^CONFIG_ 行
+          sed 's/^[[:space:]]*//' >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-app-ssr-plus=y
+          CONFIG_PACKAGE_luci-app-smartdns=y
+          CONFIG_PACKAGE_luci-app-turboacc=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-argon-config=y
+          CONFIG_PACKAGE_adguardhome=y
+          CONFIG_PACKAGE_ariang=y
+          CONFIG_PACKAGE_aria2=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_tcpdump-mini=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          # 注意：本机型走 MTK 私有 wifi 栈（mtwifi-cfg + kmod-mt_wifi），
+          # 不是 hostapd/wpad，所以【不要】选 wpad-*，否则会冲突。
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-app-filetransfer=y
+          CONFIG_PACKAGE_luci-app-diskman=y
+          CONFIG_PACKAGE_luci-app-zerotier=y
+          CONFIG_PACKAGE_zerotier=y
+          EOF
+
+          echo "=== 解析配置（补齐依赖 / 丢弃不存在的包）==="
+          make defconfig
+
+          echo "=== 复核最终关键项 ==="
+          grep -E '^CONFIG_TARGET_DEVICE_mediatek_mt7986_DEVICE_xiaomi_redmi-router-ax6000|^CONFIG_PACKAGE_(luci-app-openclash|luci-app-passwall|adguardhome|ariang)=' .config || true
+
+      # ---------------------------------------------------------------- 编译
+      - name: 预下载源码包
+        working-directory: openwrt
+        run: |
+          make download -j"$(nproc)" || make download -j8 || true
+
+      - name: 编译
+        working-directory: openwrt
+        run: |
+          echo "核数: $(nproc)"
+          # 第一次并行编译；失败则单线程重跑以拿到详细报错（便于排查）
+          make -j"$(nproc)" || make -j1 V=s
+
+      # ---------------------------------------------------------------- 收集
+      - name: 收集产物（只取 AX6000 110M）
+        id: collect
+        working-directory: openwrt
+        run: |
+          OUT=bin/targets/mediatek/mt7986
+          echo "=== 上游产物清单 ==="
+          ls -lh "$OUT" || true
+
+          mkdir -p /tmp/fw
+          for f in "$OUT"/immortalwrt-mediatek-mt7986-xiaomi_redmi-router-ax6000-* \
+                   "$OUT"/immortalwrt-xiaomi_redmi-router-ax6000-*; do
+            [ -e "$f" ] || continue
+            [ -f "$f" ] || continue
+            cp -v "$f" /tmp/fw/ 2>/dev/null || true
+          done
+          for extra in sha256sums profiles.json config.buildinfo version.buildinfo; do
+            [ -f "$OUT/$extra" ] && cp -v "$OUT/$extra" /tmp/fw/ || true
+          done
+
+          cd /tmp/fw
+          ls -1
+          ls -1 | grep -q 'squashfs-sysupgrade.bin' || { echo "!! 未找到 sysupgrade.bin，编译可能失败"; exit 1; }
+          sha256sum ./* > SHA256SUMS.txt 2>/dev/null || true
+          echo "----- SHA256SUMS.txt -----"; cat SHA256SUMS.txt
+          echo "count=$(ls -1 | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: 写入可审计来源信息
+        run: |
+          cd /tmp/fw
+          {
+            echo "built_at_utc   = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source_repo    = $REPO_URL"
+            echo "source_branch  = $REPO_BRANCH"
+            echo "source_commit  = $HEAD_SHA"
+            echo "device_profile = xiaomi_redmi-router-ax6000 (110M layout, NON-stock)"
+            echo "workflow_run   = https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "runner_os      = $(uname -srmo)"
+            echo
+            echo "--- 源码 HEAD ---"
+            cat /tmp/src_head.txt
+            echo
+            echo "--- 固件内是否残留个人凭据（应全部为 0）---"
+            for k in '637143646974' '851129' '19851129z'; do
+              n=$(grep -ac "$k" ./*.bin 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+              echo "  '$k' 出现次数(明文) = $n"
+            done
+          } > BUILD_PROVENANCE.txt
+          cat BUILD_PROVENANCE.txt
+
+      # ---------------------------------------------------------------- 输出
+      - name: 上传 Artifact
+        if: ${{ inputs.upload_artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax6000-110m-run${{ github.run_number }}
+          path: /tmp/fw/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 创建 Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ax6000-110m-${{ github.run_number }}
+          name: "ImmortalWrt AX6000 110M #${{ github.run_number }}"
+          body: |
+            **Redmi AX6000 · ImmortalWrt · 110M 布局（非 stock）**
+
+            - 源码：`hanwckf/immortalwrt-mt798x` @ `${{ env.REPO_BRANCH }}`
+            - commit：`${{ env.HEAD_SHA }}`
+            - 设备项：`xiaomi_redmi-router-ax6000`（110M，配合 hanwckf 多布局 U-Boot 使用）
+            - 编译运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            > 刷机时在 U-Boot 菜单里选 **immortalwrt-110m** 布局；刷入 sysupgrade.bin。
+          files: /tmp/fw/*
+          draft: false
+          prerelease: false
